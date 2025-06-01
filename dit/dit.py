@@ -4,11 +4,25 @@ from torch.nn import functional as F
 import math
 from dit.dit_block import DiTBlock, AdaLN, FeedForward
 
+
+def timestep_embedding(timesteps, dim, max_period=10000):
+    ## Build sinusoidal embeddings. 
+    ## timesteps: (B,) int64/float tensor - returns (B, dim) float32.
+    half_dim = dim // 2
+    freqs = torch.exp(
+        -math.log(max_period) * torch.arange(half_dim, device=timesteps.device) / half_dim
+    )
+    args = timesteps[:, None].float() * freqs[None]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    if dim % 2:  # zero-pad if dim is odd
+        emb = torch.cat([emb, emb.new_zeros(emb.size(0), 1)], dim=1)
+    return emb
+
 class TimeEmbedding(nn.Module):
     # input : (B, 256)
     # turns freq-time embedding into (B, 256)
 
-     def __init__(self, orig_dim: int):
+     def __init__(self, orig_dim):
          super().__init__()
 
          self.linear1 = nn.Linear(orig_dim, 256)
@@ -58,20 +72,14 @@ class Patchify(nn.Module):
         self.patch_proj = nn.Conv2d(self.num_channels, self.hidden_dim, 
                                     kernel_size=self.patch_size, stride=self.patch_size)
         
-    def sinusoidal_positional_emb(self, length, dim):
-
-        positions_matrix = torch.zeros(length, dim)
-        pos = torch.arange(0, length).unsqueeze(1) # (16, 1)
-
-        # P(k, 2i) = sin( k * 1 / 10000^(2i/d))
-        # P(k, 2i + 1) = cos (K * 1 / 10000^(2i/d))
-        div_term = torch.exp((torch.arange(0, dim, 2, dtype=torch.float) *
-                         -(math.log(10000.0) / dim)))
-        
-        positions_matrix[:, 0::2] = torch.sin(pos.float() * div_term)
-        positions_matrix[:, 1::2] = torch.cos(pos.float() * div_term)
-        # (16, 384)
-        return positions_matrix
+    def sinusoidal_positional_emb(self, length, dim, device):
+        pos = torch.arange(length, device=device).unsqueeze(1)      # (T,1)
+        div = torch.exp(torch.arange(0, dim, 2, device=device, dtype=torch.float32)
+                     * -(math.log(10000.0)/dim))
+        mat = torch.zeros(length, dim, device=device)
+        mat[:, 0::2] = torch.sin(pos * div)
+        mat[:, 1::2] = torch.cos(pos * div)
+        return mat
 
     def forward(self, x):
         # x: (B, C, I, I) = (B, 4, 32, 32)
@@ -82,7 +90,7 @@ class Patchify(nn.Module):
         # (B, 384, 16) -> (B, 16, 384)
         x = x.transpose(-1, -2)
         # (B, 16, 384)
-        x = x + self.sinusoidal_positional_emb(self.num_patches, self.hidden_dim)
+        x = x + self.sinusoidal_positional_emb(self.num_patches, self.hidden_dim, x.device)
         return x
 
 class OutputCondMLP(nn.Module):
@@ -162,24 +170,33 @@ class DiffusionTransformer(nn.Module):
         x = x.reshape(B, 2*self.num_channels, Ip*p, Ip*p)
 
         noise, cov_matrix = x.chunk(2, dim=1)
+        # (B, 2C, I, I)
         return noise, cov_matrix
 
 
 class DiffusionTransformerModel(nn.Module):
-    def __init__(self, dit):
+    def __init__(self, dit, time_embed_dim=256):
         super().__init__()
         self.dit = dit
+        self.time_dim = time_embed_dim
     
-    def forward(self, x, t, y=None):
-        t = t.float()
-
-        if y is None:
-            y = torch.zeros(x.shape[0], 1000)
-        elif y.dim() == 1:
-            y = F.one_hot(y, num_classes=1000).float()
+    def forward_with_cfg(self, x, t, y, cfg_scale=4.0):
+        eps_cond   = self.forward(x, t, y) # (B, 2C, I, I)
+        eps_uncond = self.forward(x, t, None) # (B, 2C, I, I)
+        return eps_uncond + cfg_scale * (eps_cond - eps_uncond)
         
-        noise, cov = self.dit(x, t, y)
-        return noise
+    def forward(self, x, t, y=None):
+        # t: (B,), turn into (B, 256)
+        t_emb = timestep_embedding(t, self.time_dim).to(x.device).type_as(x)
+        if y is None:
+            y_onehot = torch.zeros(x.shape[0], 1000, device=x.device)
+        elif y.dim() == 1:
+            y_onehot = F.one_hot(y, num_classes=1000).float()
+        else:
+            y_onehot = y
+        noise, cov = self.dit(x, t_emb, y_onehot)
+        # (B, 2C, I, I)
+        return torch.cat([noise, cov], dim=1)
     
 # - set up VAE enc/dec code and weights
 # - assemble pipeline, figure out time/class tensors (i.e get_time_emb)
